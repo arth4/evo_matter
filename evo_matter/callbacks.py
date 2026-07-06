@@ -74,8 +74,8 @@ class CopyRegion(Callback):
     to a random location in the model.
     """
 
-    def __init__(self, copy_target_value=1, copy_distinct=False, **kwargs):
-        super().__init__(copy_target_value=copy_target_value, copy_distinct=copy_distinct, **kwargs)
+    def __init__(self, copy_target_value=1, copy_distinct=False, copy_in_bounds=None, copy_out_bounds=None, **kwargs):
+        super().__init__(copy_target_value=copy_target_value, copy_distinct=copy_distinct, copy_in_bounds=copy_in_bounds, copy_out_bounds=copy_out_bounds, **kwargs)
         self._neighbor_list = None
 
     def on_sample(self, i, model, result):
@@ -86,36 +86,136 @@ class CopyRegion(Callback):
         if not regions:
             return False
 
-        if self.copy_distinct:
-            # Pick a random group, then a random region within it
-            groups = group_regions(regions, model.labels)
-            group = groups[np.random.choice(list(groups.keys()))]
-            region = group[np.random.randint(len(group))]
+        mins, maxs = model.labels.min(axis=0), model.labels.max(axis=0)
+
+        # Determine destination bounds
+        if self.copy_out_bounds is not None:
+            out_bounds = normalize_bounds(self.copy_out_bounds)
         else:
-            # Pick a random region from all regions
-            region = regions[np.random.randint(len(regions))]
-        region_spins = model.spin[region]
+            out_bounds = [(mins, maxs)]
 
-        # Get lattice coordinates of the region's spins
-        region_labels = model.labels[region]
-        region_mins = region_labels.min(axis=0)
-        region_maxs = region_labels.max(axis=0)
-        region_shape = region_maxs - region_mins + 1
+        if self.copy_in_bounds is not None:
+            in_bounds = normalize_bounds(self.copy_in_bounds)
+        else:
+            in_bounds = [(mins, maxs)]
 
-        # Find a random location for the bounding box of the region
-        maxs = model.labels.max(axis=0)
-        mins = model.labels.min(axis=0)
-        loc = np.random.randint(mins, maxs - region_shape + 1)
+        regions_to_copy = []
+        for bound in in_bounds:
+            source_regions = find_regions_bounded(self._neighbor_list, model.spin, model.labels, [bound], self.copy_target_value)
+            if source_regions:
+                regions_to_copy.append(pick_region(source_regions, self.copy_distinct))
 
-        # Translate each spin's coordinate by the offset, then place it
-        offsets = region_labels - region_mins
-        new_coords = offsets + loc
+        for region in regions_to_copy:
+            random_place_region(model, region, out_bounds)
 
-        indices = model.L[new_coords[:, 0], new_coords[:, 1]]
-        model.spin[indices] = region_spins
 
         return False
+def normalize_bounds(bounds):
+    """
+    Normalize bounds to a list of (mins, maxs) pairs.
+    Accepts either [mins, maxs] or [[mins1, maxs1], ..., [minsN, maxsN]].
+    """
+    bounds = np.array(bounds)
+    if bounds.ndim == 2:
+        # single [mins, maxs]
+        return [bounds]
+    # list of [mins, maxs]
+    return list(bounds)
 
+def random_place_region(model, region, out_bounds):
+    """
+    Place a region at a random location within a randomly chosen out_bound
+    that can fit the region's bounding box. Does nothing if no bound fits.
+    """
+    region_mins, _, region_shape = region_bounding_box(region, model.labels)
+
+    fitting = [
+        (b_mins, b_maxs) for b_mins, b_maxs in out_bounds
+        if np.all(b_maxs - b_mins >= region_shape - 1)
+    ]
+    if not fitting:
+        return
+
+    dst_mins, dst_maxs = fitting[np.random.randint(len(fitting))]
+    loc = np.random.randint(dst_mins, dst_maxs - region_shape + 1)
+    place_region(model, region, region_mins, loc)
+
+def place_region(model, region, region_mins, loc):
+    """Copy region spins to a new location in the model."""
+    region_labels = model.labels[region]
+    offsets = region_labels - region_mins
+    new_coords = offsets + loc
+    model.spin[model.L[new_coords[:, 0], new_coords[:, 1]]] = model.spin[region]
+
+def pick_region(regions, distinct=False):
+    """Pick a random region, optionally from distinct shapes only."""
+    if distinct:
+        groups = group_regions(regions)
+        group = groups[np.random.choice(list(groups.keys()))]
+        return group[np.random.randint(len(group))]
+    return regions[np.random.randint(len(regions))]
+
+def region_bounding_box(region, labels):
+    """Return (mins, maxs, shape) of a region's bounding box in label space."""
+    region_labels = labels[region]
+    mins = region_labels.min(axis=0)
+    maxs = region_labels.max(axis=0)
+    return mins, maxs, maxs - mins + 1
+
+def bounds_to_mask(labels, bounds):
+    """
+    Return a boolean mask of spins within any of the given bounds.
+
+    Parameters
+    ----------
+    labels : ndarray, shape (n, 2)
+    bounds : list of (mins, maxs) pairs
+    """
+    mask = np.zeros(len(labels), dtype=bool)
+    for b_mins, b_maxs in bounds:
+        in_bounds = np.all(labels >= b_mins, axis=1) & np.all(labels <= b_maxs, axis=1)
+        mask |= in_bounds
+    return mask
+
+def find_regions_bounded(neighbor_list, spin, labels, bounds, target_value=1):
+    """
+    Find connected regions of `target_value` spins, restricted to
+    spins within the given bounds.
+
+    Parameters
+    ----------
+    labels : ndarray, shape (n, 2)
+    bounds : list of (mins, maxs) pairs
+    """
+    mask = bounds_to_mask(labels, bounds)
+    return find_regions_masked(neighbor_list, spin, mask, target_value)
+
+def find_regions_masked(neighbor_list, spin, mask, target_value=1):
+    """
+    Find connected regions of `target_value` spins, restricted to
+    spins where mask is True.
+
+    Parameters
+    ----------
+    mask : ndarray of bool, shape (n,)
+    """
+    masked_spin = spin.copy()
+    masked_spin[~mask] = -target_value
+    return find_regions(neighbor_list, masked_spin, target_value)
+
+
+def group_regions(regions):
+    """
+    Group regions by their normalized shape in index space.
+
+    """
+    groups = {}
+    for region in regions:
+        region = np.array(region)
+        normalized = region - region.min(axis=0)
+        key = frozenset(normalized)
+        groups.setdefault(key, []).append(region)
+    return groups
 class FloodFill(Callback):
     """
     Callback to flood fill at a random location in the model.
@@ -210,31 +310,6 @@ def find_regions(neighbor_list, spin, target_value=1):
 
     return regions
 
-def group_regions(regions, labels):
-    """
-    Group regions by shape (translation-invariant).
-
-    Two regions are considered the same shape if their spin coordinates,
-    normalized to the origin, are identical (as sets).
-
-    Parameters
-    ----------
-    regions : list of list of int
-        Spin indices for each region (as returned by find_regions)
-    labels : ndarray, shape (n, 2)
-        Lattice coordinates of each spin (model.labels)
-
-    Returns
-    -------
-    groups : dict mapping shape_key -> list of regions
-    """
-    groups = {}
-    for region in regions:
-        coords = labels[region]
-        normalized = coords - coords.min(axis=0)
-        key = frozenset(map(tuple, normalized))
-        groups.setdefault(key, []).append(region)
-    return groups
 
 def init_neighbor_list(model, ndist=1.8):
         neighbors = []
