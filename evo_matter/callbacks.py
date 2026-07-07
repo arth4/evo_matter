@@ -26,25 +26,35 @@ class NucleateRandom(Callback):
         )
 
     def on_sample(self, i, model, result):
-        if i % self.nucleate_every != 0:
+        if i % self.nucleate_every != 0 and self.nucleate_every > 1:
             return False
         pattern_size = self.nucleate_size
-        pattern = (np.random.rand(*pattern_size) < self.nucleate_spin_prob) * 2 - 1
         maxs = model.labels.max(axis=0)
         mins = model.labels.min(axis=0)
 
-        # example: nucleate_bounds = np.array([[0, 0], [10, 10]]) to nucleate in a 10x10 box starting at (0,0)
-        # print(f"nucleate_bounds: {self.nucleate_bounds}")
-        if self.nucleate_bounds is not None:
-            mins = np.maximum(mins, self.nucleate_bounds[0])
-            maxs = np.minimum(maxs, self.nucleate_bounds[1])
-            # print(f"updated mins: {mins}, maxs: {maxs}")
-        loc = np.random.randint(mins, maxs - pattern_size + 1)
-        model.spin[
-            model.L[
-                loc[0] : loc[0] + pattern_size[0], loc[1] : loc[1] + pattern_size[1]
-            ]
-        ] = pattern.flatten()
+        repeats = int(np.round(1 / self.nucleate_every)) if self.nucleate_every < 1 else 1
+
+        for _ in range(repeats):
+            pattern = (np.random.rand(*pattern_size) < self.nucleate_spin_prob) * 2 - 1
+            # example: nucleate_bounds = np.array([[0, 0], [10, 10]]) to nucleate in a 10x10 box starting at (0,0)
+            # print(f"nucleate_bounds: {self.nucleate_bounds}")
+            if self.nucleate_bounds is not None:
+                self.nucleate_bounds = np.array(self.nucleate_bounds)
+                #check if any bounds are fractional, and if so, convert to absolute bounds
+                if np.any((self.nucleate_bounds > 0) & (self.nucleate_bounds < 1)):
+                    self.nucleate_bounds = np.array([
+                        mins + (maxs - mins) * self.nucleate_bounds[0],
+                        mins + (maxs - mins) * self.nucleate_bounds[1]
+                    ]).astype(int)
+                mins = np.maximum(mins, self.nucleate_bounds[0])
+                maxs = np.minimum(maxs, self.nucleate_bounds[1])
+                # print(f"updated mins: {mins}, maxs: {maxs}")
+            loc = np.random.randint(mins, maxs - pattern_size + 1)
+            model.spin[
+                model.L[
+                    loc[0] : loc[0] + pattern_size[0], loc[1] : loc[1] + pattern_size[1]
+                ]
+            ] = pattern.flatten()
 
 
 class KillBiggestRegion(Callback):
@@ -82,10 +92,6 @@ class CopyRegion(Callback):
         if self._neighbor_list is None:
             self._neighbor_list = init_neighbor_list(model)
 
-        regions = find_regions(self._neighbor_list, model.spin, self.copy_target_value)
-        if not regions:
-            return False
-
         mins, maxs = model.labels.min(axis=0), model.labels.max(axis=0)
 
         # Determine destination bounds
@@ -110,6 +116,75 @@ class CopyRegion(Callback):
 
 
         return False
+
+class ShootingRange(Callback):
+    """
+    Callback to implement a shooting range environment.
+    """
+
+    def __init__(self, shooting_n_rows=10, shooting_zone_frac=0.5, shooting_target_frac=0.25, **kwargs):
+        super().__init__(shooting_n_rows=shooting_n_rows, shooting_zone_frac=shooting_zone_frac, shooting_target_frac=shooting_target_frac, **kwargs)
+        self._row_fitness = None
+
+    def _init_shooting_range(self, model):
+        self._row_fitness = np.zeros(self.shooting_n_rows)
+        maxs, mins = model.labels.max(axis=0), model.labels.min(axis=0)
+        row_ys = np.linspace(mins[0], maxs[0], self.shooting_n_rows + 1).astype(np.int32)
+
+        shoot_x = int(self.shooting_zone_frac * (maxs[1] - mins[1]))
+        target_x = int((1 - self.shooting_target_frac) * (maxs[1] - mins[1]))
+
+        self._target_zones = [
+            ((row_ys[i], row_ys[i + 1] + 1), (target_x, None)) for i in range(self.shooting_n_rows)
+        ]
+        self._shoot_zones = [
+            ((row_ys[i], row_ys[i + 1] + 1), (None, shoot_x)) for i in range(self.shooting_n_rows)
+        ]
+
+        self._middle_zones = [
+            ((row_ys[i], row_ys[i + 1] + 1), (shoot_x, target_x)) for i in range(self.shooting_n_rows)
+        ]
+
+
+    def on_sample(self, i, model, result):
+        if self._row_fitness is None:
+            self._init_shooting_range(model)
+
+        on_zones = self.active_targets(model)
+        if not on_zones:
+            return False
+
+        source_row = np.random.choice(on_zones)
+        self._row_fitness += 1
+        self._row_fitness[source_row] = 0
+
+        dest_row = np.argmax(self._row_fitness)
+        self._row_fitness[dest_row] = 0
+
+        self.clear_zone(model, self._target_zones[source_row])
+        self.clear_zone(model, self._middle_zones[source_row])
+
+        self.copy_row(model, source_row, dest_row)
+
+        return False
+
+    def clear_zone(self, model, zone):
+        model.spin[model.L[zone[0][0]:zone[0][1], zone[1][0]:zone[1][1]]] = -1
+
+    def copy_row(self, model, source_row, dest_row):
+        source_zone = self._target_zones[source_row]
+        dest_zone = self._target_zones[dest_row]
+
+        source_spins = model.spin[model.L[source_zone[0][0]:source_zone[0][1], :]]
+        model.spin[model.L[dest_zone[0][0]:dest_zone[0][1], :]] = source_spins
+
+    def active_targets(self, model):
+        return [ i for i in range(self.shooting_n_rows)
+            if np.any(model.spin[model.L[self._target_zones[i][0][0]:self._target_zones[i][0][1],
+                                         self._target_zones[i][1][0]:self._target_zones[i][1][1]]
+                                ] == 1)
+        ]
+
 def normalize_bounds(bounds):
     """
     Normalize bounds to a list of (mins, maxs) pairs.
