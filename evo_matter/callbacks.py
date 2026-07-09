@@ -185,6 +185,85 @@ class ShootingRange(Callback):
                                 ] == 1)
         ]
 
+class RowActivity(Callback):
+    """
+    Callback to implement an active row environment.
+    """
+
+    def __init__(self, row_activity_n_rows=10, row_activity_timestep=4,**kwargs):
+        super().__init__(row_activity_n_rows=row_activity_n_rows, row_activity_timestep=row_activity_timestep,
+                        row_activity_ignore_edge=4, **kwargs)
+        self._rows = None
+        self._x_range = None
+
+    def _init_rows(self, model):
+        maxs, mins = model.labels.max(axis=0), model.labels.min(axis=0)
+        row_ys = np.linspace(mins[0], maxs[0], self.row_activity_n_rows + 1).astype(np.int32)
+
+        self._rows = [
+            ((row_ys[i], row_ys[i + 1] + 1), (None, None)) for i in range(self.row_activity_n_rows)
+        ]
+        self._x_range = (mins[1] + self.row_activity_ignore_edge, maxs[1] - self.row_activity_ignore_edge)
+
+    def on_sample(self, i, model, result):
+        if self._rows is None:
+            self._init_rows(model)
+
+        active_rows, frozen_rows = self.active_frozen_rows(model, result)
+        if not frozen_rows:
+            return False
+
+        for frozen_row in frozen_rows:
+            if len(active_rows) < 2:
+                self.randomize_row(model, frozen_row)
+            else:
+                row1, row2 = np.random.choice(active_rows, 2, replace=False)
+                self.row_crossover(model, row1, row2, frozen_row)
+
+        return False
+
+    def active_frozen_rows(self, model, result):
+        if len(result["spin"]) <= self.row_activity_timestep: # not enough history to determine activity
+            return None, None
+
+        this_step = result["spin"][-1]
+        last_step = result["spin"][-self.row_activity_timestep - 1]
+        active_rows = []
+        frozen_rows = []
+
+        for i, row in enumerate(self._rows):
+            this_row = this_step[model.L[row[0][0]:row[0][1], self._x_range[0]:self._x_range[1]]]
+            last_row = last_step[model.L[row[0][0]:row[0][1], self._x_range[0]:self._x_range[1]]]
+
+            if np.any(this_row != last_row):
+                active_rows.append(i)
+            else:
+                frozen_rows.append(i)
+
+        return active_rows, frozen_rows
+
+
+    def row_crossover(self, model, row1, row2, dest_row):
+        row1_zone = self._rows[row1]
+        row2_zone = self._rows[row2]
+        dest_zone = self._rows[dest_row]
+
+        # use min height to handle rows of different sizes
+        h = min(
+            row1_zone[0][1] - row1_zone[0][0],
+            row2_zone[0][1] - row2_zone[0][0],
+            dest_zone[0][1] - dest_zone[0][0],
+        )
+
+        crossover_point = np.random.randint(self._x_range[0], self._x_range[1])
+
+        model.spin[model.L[dest_zone[0][0]:dest_zone[0][0]+h, :]] =                 model.spin[model.L[row1_zone[0][0]:row1_zone[0][0]+h, :]]
+        model.spin[model.L[dest_zone[0][0]:dest_zone[0][0]+h, crossover_point:]] =  model.spin[model.L[row2_zone[0][0]:row2_zone[0][0]+h, crossover_point:]]
+
+    def randomize_row(self, model, row):
+        indices = model.L[self._rows[row][0][0]:self._rows[row][0][1], :]
+        model.spin[indices] = np.random.choice([-1, 1], p=[0.8, 0.2], size=indices.shape)
+
 def normalize_bounds(bounds):
     """
     Normalize bounds to a list of (mins, maxs) pairs.
