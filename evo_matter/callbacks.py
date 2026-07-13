@@ -264,6 +264,126 @@ class RowActivity(Callback):
         indices = model.L[self._rows[row][0][0]:self._rows[row][0][1], :]
         model.spin[indices] = np.random.choice([-1, 1], p=[0.8, 0.2], size=indices.shape)
 
+class GridActivity(Callback):
+    """
+    Callback to implement an active grid environment.
+    Divides the model into a grid of cells and performs crossover
+    on frozen cells. Set grid_activity_n_cols=1 to recover row-based behaviour.
+    """
+
+    def __init__(self, grid_activity_n_rows=5, grid_activity_n_cols=5,
+                 grid_activity_timestep=4, grid_activity_ignore_edge=4, grid_activity_mut_size=(4,4), **kwargs):
+        super().__init__(grid_activity_n_rows=grid_activity_n_rows,
+                         grid_activity_n_cols=grid_activity_n_cols,
+                         grid_activity_timestep=grid_activity_timestep,
+                         grid_activity_ignore_edge=grid_activity_ignore_edge,
+                         grid_activity_mut_size=grid_activity_mut_size, **kwargs)
+        self._cells = None
+        self._inner_range = None
+
+    def _init_cells(self, model):
+        maxs, mins = model.labels.max(axis=0), model.labels.min(axis=0)
+        row_ys = np.linspace(mins[0], maxs[0], self.grid_activity_n_rows + 1).astype(np.int32)
+        col_xs = np.linspace(mins[1], maxs[1], self.grid_activity_n_cols + 1).astype(np.int32)
+
+        self._cells = [
+            ((row_ys[i], row_ys[i + 1] + 1), (col_xs[j], col_xs[j + 1] + 1))
+            for i in range(self.grid_activity_n_rows)
+            for j in range(self.grid_activity_n_cols)
+        ]
+        e = self.grid_activity_ignore_edge
+        self._inner_range = (
+            (mins[0] + e, maxs[0] - e),
+            (mins[1] + e, maxs[1] - e),
+        )
+
+        # print unique cell sizes
+        sizes = set(
+            (c[0][1] - c[0][0], c[1][1] - c[1][0])
+            for c in self._cells
+        )
+        for h, w in sorted(sizes):
+            print(f"GridActivity cell size: {h}h x {w}w")
+
+    def _cell_indices(self, model, cell, h=None):
+        y0, y1 = cell[0]
+        x0, x1 = cell[1]
+        if h is not None:
+            y1 = y0 + h
+        return model.L[y0:y1, x0:x1]
+
+    def _cell_inner_indices(self, model, cell):
+        """Indices clipped to inner range (ignoring edges) for activity detection."""
+        y0 = max(cell[0][0], self._inner_range[0][0])
+        y1 = min(cell[0][1], self._inner_range[0][1])
+        x0 = max(cell[1][0], self._inner_range[1][0])
+        x1 = min(cell[1][1], self._inner_range[1][1])
+        return model.L[y0:y1, x0:x1]
+
+    def on_sample(self, i, model, result):
+        if self._cells is None:
+            self._init_cells(model)
+
+        active_cells, frozen_cells = self.active_frozen_cells(model, result)
+        if not frozen_cells:
+            return False
+
+        for frozen_cell in frozen_cells:
+            if len(active_cells) < 2:
+                self.randomize_cell(model, frozen_cell)
+            else:
+                cell1, cell2 = np.random.choice(active_cells, 2, replace=False)
+                self.cell_crossover(model, cell1, cell2, frozen_cell)
+
+        return False
+
+    def active_frozen_cells(self, model, result):
+        if len(result["spin"]) <= self.grid_activity_timestep:
+            return None, None
+
+        this_step = result["spin"][-1]
+        last_step = result["spin"][-self.grid_activity_timestep - 1]
+        active_cells = []
+        frozen_cells = []
+
+        for i, cell in enumerate(self._cells):
+            idx = self._cell_inner_indices(model, cell)
+            if np.any(this_step[idx] != last_step[idx]):
+                active_cells.append(i)
+            else:
+                frozen_cells.append(i)
+
+        return active_cells, frozen_cells
+
+    def cell_crossover(self, model, cell1, cell2, dest_cell):
+        c1, c2, cd = self._cells[cell1], self._cells[cell2], self._cells[dest_cell]
+
+        h = min(c1[0][1] - c1[0][0], c2[0][1] - c2[0][0], cd[0][1] - cd[0][0])
+        w = min(c1[1][1] - c1[1][0], c2[1][1] - c2[1][0], cd[1][1] - cd[1][0])
+
+        dest_idx = model.L[cd[0][0]:cd[0][0]+h, cd[1][0]:cd[1][0]+w]
+        src1_idx = model.L[c1[0][0]:c1[0][0]+h, c1[1][0]:c1[1][0]+w]
+        src2_idx = model.L[c2[0][0]:c2[0][0]+h, c2[1][0]:c2[1][0]+w]
+
+        n = min(len(dest_idx), len(src1_idx), len(src2_idx))
+        crossover_point = np.random.randint(0, n)
+
+        model.spin[dest_idx[:n]] = model.spin[src1_idx[:n]]
+        model.spin[dest_idx[crossover_point:n]] = model.spin[src2_idx[crossover_point:n]]
+
+        if self.grid_activity_mut_size is not None:
+            mh, mw = self.grid_activity_mut_size
+            if h >= mh and w >= mw:
+                mut_y = np.random.randint(cd[0][0], cd[0][0] + h - mh + 1)
+                mut_x = np.random.randint(cd[1][0], cd[1][0] + w - mw + 1)
+                mut_idx = model.L[mut_y:mut_y+mh, mut_x:mut_x+mw]
+                model.spin[mut_idx] = np.random.choice([-1, 1], p=[0.8, 0.2], size=len(mut_idx))
+
+    def randomize_cell(self, model, cell):
+        indices = self._cell_indices(model, self._cells[cell])
+        model.spin[indices] = np.random.choice([-1, 1], p=[0.8, 0.2], size=indices.shape)
+
+
 def normalize_bounds(bounds):
     """
     Normalize bounds to a list of (mins, maxs) pairs.
