@@ -285,7 +285,7 @@ def random_place_region(model, region, out_bounds):
 
     fitting = [
         (b_mins, b_maxs) for b_mins, b_maxs in out_bounds
-        if np.all(b_maxs - b_mins >= region_shape - 1)
+        if np.all(b_maxs - b_mins >= region_shape)
     ]
     if not fitting:
         return
