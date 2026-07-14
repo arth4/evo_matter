@@ -1,3 +1,5 @@
+from unittest import result
+
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -122,50 +124,58 @@ class ShootingRange(Callback):
     Callback to implement a shooting range environment.
     """
 
-    def __init__(self, shooting_n_rows=10, shooting_zone_frac=0.5, shooting_target_frac=0.25, **kwargs):
-        super().__init__(shooting_n_rows=shooting_n_rows, shooting_zone_frac=shooting_zone_frac, shooting_target_frac=shooting_target_frac, **kwargs)
-        self._row_fitness = None
+    def __init__(self, shooting_n_rows=10, shooting_zone_frac=0.5, shooting_eval_every=21*4-1, shooting_mut_size=(4, 4), shooting_timestep=4, **kwargs):
+        super().__init__(shooting_n_rows=shooting_n_rows, shooting_zone_frac=shooting_zone_frac, shooting_eval_every=shooting_eval_every,
+                         shooting_mut_size=shooting_mut_size, shooting_timestep=shooting_timestep, **kwargs)
+        self._last_init = None
 
     def _init_shooting_range(self, model):
-        self._row_fitness = np.zeros(self.shooting_n_rows)
+        self._neighbor_list = init_neighbor_list(model)
         maxs, mins = model.labels.max(axis=0), model.labels.min(axis=0)
         row_ys = np.linspace(mins[0], maxs[0], self.shooting_n_rows + 1).astype(np.int32)
 
         shoot_x = int(self.shooting_zone_frac * (maxs[1] - mins[1]))
-        target_x = int((1 - self.shooting_target_frac) * (maxs[1] - mins[1]))
 
         self._target_zones = [
-            ((row_ys[i], row_ys[i + 1] + 1), (target_x, None)) for i in range(self.shooting_n_rows)
+            ((row_ys[i], row_ys[i + 1] + 1), (shoot_x, maxs[1])) for i in range(self.shooting_n_rows)
         ]
         self._shoot_zones = [
-            ((row_ys[i], row_ys[i + 1] + 1), (None, shoot_x)) for i in range(self.shooting_n_rows)
+            ((row_ys[i], row_ys[i + 1] + 1), (mins[1], shoot_x)) for i in range(self.shooting_n_rows)
         ]
 
-        self._middle_zones = [
-            ((row_ys[i], row_ys[i + 1] + 1), (shoot_x, target_x)) for i in range(self.shooting_n_rows)
-        ]
+        self._last_init = -2
+
+
+    def eval_fitness(self, model):
+        fitness = np.zeros(self.shooting_n_rows)
+        for i, zone in enumerate(self._target_zones):
+            mask = bounds_to_mask(model.labels, [zone])
+            regions = find_regions_masked(self._neighbor_list, model.spin, mask, target_value=1)
+            fitness[i] = len(regions)
+        return fitness
 
 
     def on_sample(self, i, model, result):
-        if self._row_fitness is None:
+        if self._last_init is None:
             self._init_shooting_range(model)
 
-        on_zones = self.active_targets(model)
-        if not on_zones:
+        self._last_init += 1
+
+        if not (self._last_init==-1 or self._last_init >= self.shooting_eval_every or not self.all_frozen(i, model, result)):
             return False
 
-        source_row = np.random.choice(on_zones)
-        self._row_fitness += 1
-        self._row_fitness[source_row] = 0
 
-        dest_row = np.argmax(self._row_fitness)
-        self._row_fitness[dest_row] = 0
+        fitness = self.eval_fitness(model)
+        rank = np.argsort(fitness)
+        losers = rank[:len(rank) // 2]
+        winners = rank[-(len(rank) // 2):]
 
-        self.clear_zone(model, self._target_zones[source_row])
-        self.clear_zone(model, self._middle_zones[source_row])
+        for source_row, dest_row in zip(winners, losers):
+            self.clear_zone(model, self._target_zones[source_row])
+            self.copy_row(model, source_row, dest_row)
+            self.mutate(model, self._shoot_zones[dest_row])
 
-        self.copy_row(model, source_row, dest_row)
-
+        self._last_init = 0
         return False
 
     def clear_zone(self, model, zone):
@@ -178,12 +188,31 @@ class ShootingRange(Callback):
         source_spins = model.spin[model.L[source_zone[0][0]:source_zone[0][1], :]]
         model.spin[model.L[dest_zone[0][0]:dest_zone[0][1], :]] = source_spins
 
-    def active_targets(self, model):
-        return [ i for i in range(self.shooting_n_rows)
-            if np.any(model.spin[model.L[self._target_zones[i][0][0]:self._target_zones[i][0][1],
-                                         self._target_zones[i][1][0]:self._target_zones[i][1][1]]
-                                ] == 1)
-        ]
+    def all_frozen(self, i, model, result):
+
+        spin = result["spin"][-self._last_init:]
+
+        if len(spin) <= self.shooting_timestep:
+            return False
+
+        this_step = spin[-1]
+        last_step = spin[-self.shooting_timestep - 1]
+
+        return np.all(this_step == last_step)
+
+
+    def mutate(self, model, zone):
+        if self.shooting_mut_size is not None:
+            mh, mw = self.shooting_mut_size
+            y0, y1 = zone[0]
+            x0 = zone[1][0] or 0
+            x1 = zone[1][1] or model.labels.max(axis=0)[1]
+            h, w = y1 - y0, x1 - x0
+            if h >= mh and w >= mw:
+                mut_y = np.random.randint(y0, y0 + h - mh + 1)
+                mut_x = np.random.randint(x0, x0 + w - mw + 1)
+                mut_idx = model.L[mut_y:mut_y+mh, mut_x:mut_x+mw]
+                model.spin[mut_idx] = np.random.choice([-1, 1], p=[0.7, 0.3], size=len(mut_idx))
 
 class RowActivity(Callback):
     """
