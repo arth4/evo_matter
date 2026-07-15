@@ -124,7 +124,7 @@ class ShootingRange(Callback):
     Callback to implement a shooting range environment.
     """
 
-    def __init__(self, shooting_n_rows=10, shooting_zone_frac=0.5, shooting_eval_every=21*4-1, shooting_mut_size=(4, 4), shooting_timestep=4, **kwargs):
+    def __init__(self, shooting_n_rows=10, shooting_zone_frac=0.5, shooting_eval_every=21*4-1, shooting_mut_size=(7, 7), shooting_timestep=4, **kwargs):
         super().__init__(shooting_n_rows=shooting_n_rows, shooting_zone_frac=shooting_zone_frac, shooting_eval_every=shooting_eval_every,
                          shooting_mut_size=shooting_mut_size, shooting_timestep=shooting_timestep, **kwargs)
         self._last_init = None
@@ -161,7 +161,7 @@ class ShootingRange(Callback):
 
         self._last_init += 1
 
-        if not (self._last_init==-1 or self._last_init >= self.shooting_eval_every or not self.all_frozen(i, model, result)):
+        if not (self._last_init==-1 or self._last_init >= self.shooting_eval_every or self.all_frozen(i, model, result)):
             return False
 
 
@@ -175,11 +175,18 @@ class ShootingRange(Callback):
             self.copy_row(model, source_row, dest_row)
             self.mutate(model, self._shoot_zones[dest_row])
 
+        # randomize worst loser
+        self.randomize_zone(model, self._shoot_zones[losers[0]])
+
         self._last_init = 0
         return False
 
     def clear_zone(self, model, zone):
         model.spin[model.L[zone[0][0]:zone[0][1], zone[1][0]:zone[1][1]]] = -1
+
+    def randomize_zone(self, model, zone):
+        indices = model.L[zone[0][0]:zone[0][1], zone[1][0]:zone[1][1]]
+        model.spin[indices] = np.random.choice([-1, 1], p=[0.7, 0.3], size=indices.shape)
 
     def copy_row(self, model, source_row, dest_row):
         source_zone = self._target_zones[source_row]
