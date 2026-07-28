@@ -124,7 +124,7 @@ class ShootingRange(Callback):
     Callback to implement a shooting range environment.
     """
 
-    def __init__(self, shooting_n_rows=10, shooting_zone_frac=0.5, shooting_eval_every=21*4-1, shooting_mut_size=(7, 7), shooting_timestep=4, **kwargs):
+    def __init__(self, shooting_n_rows=8, shooting_zone_frac=0.5, shooting_eval_every=20*4, shooting_mut_size=(7, 7), shooting_timestep=4, **kwargs):
         super().__init__(shooting_n_rows=shooting_n_rows, shooting_zone_frac=shooting_zone_frac, shooting_eval_every=shooting_eval_every,
                          shooting_mut_size=shooting_mut_size, shooting_timestep=shooting_timestep, **kwargs)
         self._last_init = None
@@ -143,32 +143,49 @@ class ShootingRange(Callback):
             ((row_ys[i], row_ys[i + 1] + 1), (mins[1], shoot_x)) for i in range(self.shooting_n_rows)
         ]
 
-        self._last_init = -2
 
 
-    def eval_fitness(self, model):
+    def eval_fitness(self, model, result):
         fitness = np.zeros(self.shooting_n_rows)
-        for i, zone in enumerate(self._target_zones):
-            mask = bounds_to_mask(model.labels, [zone])
+        spins = result["spin"][-self.shooting_eval_every:]
+
+        for i, (shoot_zone, target_zone) in enumerate(zip(self._shoot_zones, self._target_zones)):
+            shoot_idx = model.L[shoot_zone[0][0]:shoot_zone[0][1], shoot_zone[1][0]:shoot_zone[1][1]]
+
+            # longevity: how many timesteps before the shoot zone froze
+            longevity = self.shooting_eval_every
+            for t in range(len(spins) - 1):
+                if np.all(spins[t][shoot_idx] == spins[t+1][shoot_idx]):
+                    longevity = t
+                    break
+
+            # number of disconnected regions in target zone
+            mask = bounds_to_mask(model.labels, [(
+                np.array([target_zone[0][0], target_zone[1][0]]),
+                np.array([target_zone[0][1], target_zone[1][1]])
+            )])
             regions = find_regions_masked(self._neighbor_list, model.spin, mask, target_value=1)
-            fitness[i] = len(regions)
+
+            fitness[i] = longevity * (len(regions) + 1)
+
         return fitness
 
 
     def on_sample(self, i, model, result):
         if self._last_init is None:
             self._init_shooting_range(model)
+            self.clear_border(model, 2)
 
-        self._last_init += 1
 
-        if not (self._last_init==-1 or self._last_init >= self.shooting_eval_every or self.all_frozen(i, model, result)):
+        if (i % self.shooting_eval_every) != 0 or i == 0:
             return False
 
-
-        fitness = self.eval_fitness(model)
+        fitness = self.eval_fitness(model, result)
         rank = np.argsort(fitness)
         losers = rank[:len(rank) // 2]
         winners = rank[-(len(rank) // 2):]
+        neutrals = rank[len(rank) // 2 : -(len(rank) // 2)]
+        self.reset_rows(model, result)
 
         for source_row, dest_row in zip(winners, losers):
             self.clear_zone(model, self._target_zones[source_row])
@@ -176,9 +193,18 @@ class ShootingRange(Callback):
             self.mutate(model, self._shoot_zones[dest_row])
 
         # randomize worst loser
-        self.randomize_zone(model, self._shoot_zones[losers[0]])
+        if len(losers) > 1:
+            self.randomize_zone(model, self._shoot_zones[losers[0]])
 
+        if neutrals and len(winners) >1:
+            dest_row = neutrals[0]
+            self.clear_zone(model, self._target_zones[source_row])
+            self.copy_row(model, winners[-1], dest_row)
+            self.copy_row(model, winners[-2], dest_row, add=True)
+
+        self.clear_border(model, 2)
         self._last_init = 0
+
         return False
 
     def clear_zone(self, model, zone):
@@ -186,14 +212,45 @@ class ShootingRange(Callback):
 
     def randomize_zone(self, model, zone):
         indices = model.L[zone[0][0]:zone[0][1], zone[1][0]:zone[1][1]]
-        model.spin[indices] = np.random.choice([-1, 1], p=[0.7, 0.3], size=indices.shape)
+        model.spin[indices] = np.random.choice([-1, 1], p=[0.85, 0.15], size=indices.shape)
 
-    def copy_row(self, model, source_row, dest_row):
+    # def randomize_zone(self, model, zone):
+    #     for _ in range(3):
+    #         self.mutate(model, zone)
+
+    def reset_rows(self, model, result):
+        """Reset shoot zones to state at t_(now-N) and clear target zones."""
+        start_spin = result["spin"][-self.shooting_eval_every]
+        for i in range(self.shooting_n_rows):
+            zone = self._shoot_zones[i]
+            idx = model.L[zone[0][0]:zone[0][1], zone[1][0]:zone[1][1]]
+            model.spin[idx] = start_spin[idx]
+            self.clear_zone(model, self._target_zones[i])
+
+    def copy_row(self, model, source_row, dest_row, add=False):
         source_zone = self._target_zones[source_row]
         dest_zone = self._target_zones[dest_row]
 
         source_spins = model.spin[model.L[source_zone[0][0]:source_zone[0][1], :]]
-        model.spin[model.L[dest_zone[0][0]:dest_zone[0][1], :]] = source_spins
+        dest_spin_idxs = model.L[dest_zone[0][0]:dest_zone[0][1], :]
+        if not add:
+            model.spin[dest_spin_idxs] = source_spins
+        else:
+            model.spin[dest_spin_idxs] = np.maximum(model.spin[dest_spin_idxs], source_spins)
+
+    def clear_border(self, model, border_thickness):
+        """Set spins along the border to -1."""
+        mins, maxs = model.labels.min(axis=0), model.labels.max(axis=0)
+
+        borders = [
+            model.L[mins[0]:mins[0]+border_thickness, :],  # top
+            model.L[maxs[0]-border_thickness:maxs[0], :],  # bottom
+            model.L[:, mins[1]:mins[1]+border_thickness],  # left
+            model.L[:, maxs[1]-border_thickness:maxs[1]],  # right
+        ]
+
+        for idx in borders:
+            model.spin[idx] = -1
 
     def all_frozen(self, i, model, result):
 
@@ -208,18 +265,26 @@ class ShootingRange(Callback):
         return np.all(this_step == last_step)
 
 
-    def mutate(self, model, zone):
-        if self.shooting_mut_size is not None:
-            mh, mw = self.shooting_mut_size
-            y0, y1 = zone[0]
-            x0 = zone[1][0] or 0
-            x1 = zone[1][1] or model.labels.max(axis=0)[1]
-            h, w = y1 - y0, x1 - x0
-            if h >= mh and w >= mw:
-                mut_y = np.random.randint(y0, y0 + h - mh + 1)
-                mut_x = np.random.randint(x0, x0 + w - mw + 1)
-                mut_idx = model.L[mut_y:mut_y+mh, mut_x:mut_x+mw]
-                model.spin[mut_idx] = np.random.choice([-1, 1], p=[0.7, 0.3], size=len(mut_idx))
+    def mutate(self, model, zone, perc=0.01):
+        y0, y1 = zone[0]
+        x0 = zone[1][0] or 0
+        x1 = zone[1][1] or model.labels.max(axis=0)[1]
+        h, w = y1 - y0, x1 - x0
+        mut_idx = model.L[y0:y1, x0:x1]
+        model.spin[mut_idx] *= np.random.choice([-1, 1], p=[perc, 1-perc], size=len(mut_idx))
+
+    # def mutate(self, model, zone):
+    #     if self.shooting_mut_size is not None:
+    #         mh, mw = self.shooting_mut_size
+    #         y0, y1 = zone[0]
+    #         x0 = zone[1][0] or 0
+    #         x1 = zone[1][1] or model.labels.max(axis=0)[1]
+    #         h, w = y1 - y0, x1 - x0
+    #         if h >= mh and w >= mw:
+    #             mut_y = np.random.randint(y0, y0 + h - mh + 1)
+    #             mut_x = np.random.randint(x0, x0 + w - mw + 1)
+    #             mut_idx = model.L[mut_y:mut_y+mh, mut_x:mut_x+mw]
+    #             model.spin[mut_idx] = np.random.choice([-1, 1], p=[0.7, 0.3], size=len(mut_idx))
 
 class RowActivity(Callback):
     """
