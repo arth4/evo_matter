@@ -174,8 +174,8 @@ class ShootingRange(Callback):
     def on_sample(self, i, model, result):
         if self._last_init is None:
             self._init_shooting_range(model)
-            self.clear_border(model, 2)
 
+        self.clear_border(model, 2)
 
         if (i % self.shooting_eval_every) != 0 or i == 0:
             return False
@@ -185,7 +185,7 @@ class ShootingRange(Callback):
         losers = rank[:len(rank) // 2]
         winners = rank[-(len(rank) // 2):]
         neutrals = rank[len(rank) // 2 : -(len(rank) // 2)]
-        self.reset_rows(model, result)
+
 
         for source_row, dest_row in zip(winners, losers):
             self.clear_zone(model, self._target_zones[source_row])
