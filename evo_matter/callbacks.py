@@ -186,9 +186,9 @@ class ShootingRange(Callback):
         winners = rank[-(len(rank) // 2):]
         neutrals = rank[len(rank) // 2 : -(len(rank) // 2)]
 
+        self.reset_rows(model, result)
 
         for source_row, dest_row in zip(winners, losers):
-            self.clear_zone(model, self._target_zones[source_row])
             self.copy_row(model, source_row, dest_row)
             self.mutate(model, self._shoot_zones[dest_row])
 
@@ -198,7 +198,6 @@ class ShootingRange(Callback):
 
         if neutrals and len(winners) >1:
             dest_row = neutrals[0]
-            self.clear_zone(model, self._target_zones[source_row])
             self.copy_row(model, winners[-1], dest_row)
             self.copy_row(model, winners[-2], dest_row, add=True)
 
@@ -228,8 +227,8 @@ class ShootingRange(Callback):
             self.clear_zone(model, self._target_zones[i])
 
     def copy_row(self, model, source_row, dest_row, add=False):
-        source_zone = self._target_zones[source_row]
-        dest_zone = self._target_zones[dest_row]
+        source_zone = self._shoot_zones[source_row]
+        dest_zone = self._shoot_zones[dest_row]
 
         source_spins = model.spin[model.L[source_zone[0][0]:source_zone[0][1], :]]
         dest_spin_idxs = model.L[dest_zone[0][0]:dest_zone[0][1], :]
