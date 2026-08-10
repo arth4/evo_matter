@@ -80,6 +80,55 @@ class KillBiggestRegion(Callback):
 
         return False
 
+class KillStillRegion(Callback):
+    """
+    Callback to kill the biggest connected region of spins equal to `target_value`.
+    """
+
+    def __init__(self, kill_still_every=8, kill_still_repeats=1, **kwargs):
+        super().__init__(kill_still_every=kill_still_every, kill_still_repeats=kill_still_repeats, **kwargs)
+        self._neighbor_list = None
+        self.prev_regions = set()
+
+    def on_sample(self, i, model, result):
+        if self._neighbor_list is None:
+            self._neighbor_list = init_neighbor_list(model)
+        if i % self.kill_still_every:
+            return
+
+        regions = find_regions(self._neighbor_list, model.spin)
+        regions = {tuple(r) for r in regions}
+        if regions and self.prev_regions:
+            common = tuple(regions & self.prev_regions)
+            for i in np.random.choice(len(common), min(self.kill_still_repeats, len(common)), replace=False):
+                model.spin[list(common[i])] = -1
+
+        self.prev_regions = regions
+        return False
+
+class Culling(Callback):
+    """
+    Callback to kill the biggest connected region of spins equal to `target_value`.
+    """
+
+    def __init__(self, culling_pop_size=30, **kwargs):
+        super().__init__(culling_pop_size=culling_pop_size, **kwargs)
+        self._neighbor_list = None
+
+    def on_sample(self, i, model, result):
+        if self._neighbor_list is None:
+            self._neighbor_list = init_neighbor_list(model)
+
+        regions = find_regions(self._neighbor_list, model.spin)
+
+        pop_size = self.culling_pop_size
+        if regions:
+            if len(regions) > pop_size:
+                for r in np.random.choice(len(regions), size=len(regions) - pop_size, replace=False):
+                    model.spin[regions[r]] = -1
+
+        return False
+
 class CopyRegion(Callback):
     """
     Callback to copy a random connected region of spins equal to `target_value`
