@@ -26,32 +26,45 @@ class NucleateRandom(Callback):
             nucleate_every=nucleate_every,
             **kwargs
         )
+        self.mins, self.maxs = None, None
 
-    def on_sample(self, i, model, result):
-        if i % self.nucleate_every != 0 and self.nucleate_every > 1:
-            return False
-        pattern_size = self.nucleate_size
+    def init(self, model):
         maxs = model.labels.max(axis=0)
         mins = model.labels.min(axis=0)
 
+        if self.nucleate_bounds is not None:
+            for i, j in np.ndindex((2,2)):
+                self.nucleate_bounds[i][j] = (mins, maxs)[i][j] if self.nucleate_bounds[i][j] is None else self.nucleate_bounds[i][j]
+
+            self.nucleate_bounds = np.array(self.nucleate_bounds)
+            #check if any bounds are fractional, and if so, convert to absolute bounds
+            if np.any((self.nucleate_bounds > 0) & (self.nucleate_bounds < 1)):
+                self.nucleate_bounds = np.array([
+                    mins + (maxs - mins) * self.nucleate_bounds[0],
+                    mins + (maxs - mins) * self.nucleate_bounds[1]
+                ]).astype(int)
+            mins = np.maximum(mins, self.nucleate_bounds[0])
+            maxs = np.minimum(maxs, self.nucleate_bounds[1])
+
+        self.mins, self.maxs = mins, maxs
+
+    def on_sample(self, i, model, result):
+        if self.mins is None:
+            self.init(model)
+
+        if i % self.nucleate_every != 0 and self.nucleate_every > 1:
+            return False
+
+        pattern_size = self.nucleate_size
         repeats = int(np.round(1 / self.nucleate_every)) if self.nucleate_every < 1 else 1
 
         for _ in range(repeats):
             pattern = (np.random.rand(*pattern_size) < self.nucleate_spin_prob) * 2 - 1
             # example: nucleate_bounds = np.array([[0, 0], [10, 10]]) to nucleate in a 10x10 box starting at (0,0)
             # print(f"nucleate_bounds: {self.nucleate_bounds}")
-            if self.nucleate_bounds is not None:
-                self.nucleate_bounds = np.array(self.nucleate_bounds)
-                #check if any bounds are fractional, and if so, convert to absolute bounds
-                if np.any((self.nucleate_bounds > 0) & (self.nucleate_bounds < 1)):
-                    self.nucleate_bounds = np.array([
-                        mins + (maxs - mins) * self.nucleate_bounds[0],
-                        mins + (maxs - mins) * self.nucleate_bounds[1]
-                    ]).astype(int)
-                mins = np.maximum(mins, self.nucleate_bounds[0])
-                maxs = np.minimum(maxs, self.nucleate_bounds[1])
+
                 # print(f"updated mins: {mins}, maxs: {maxs}")
-            loc = np.random.randint(mins, maxs - pattern_size + 1)
+            loc = np.random.randint(self.mins, self.maxs - pattern_size + 1)
             model.spin[
                 model.L[
                     loc[0] : loc[0] + pattern_size[0], loc[1] : loc[1] + pattern_size[1]
@@ -135,35 +148,51 @@ class CopyRegion(Callback):
     to a random location in the model.
     """
 
-    def __init__(self, copy_target_value=1, copy_distinct=False, copy_in_bounds=None, copy_out_bounds=None, **kwargs):
-        super().__init__(copy_target_value=copy_target_value, copy_distinct=copy_distinct, copy_in_bounds=copy_in_bounds, copy_out_bounds=copy_out_bounds, **kwargs)
+    def __init__(self, copy_target_value=1, copy_distinct=False, copy_in_bounds=None, copy_out_bounds=None, copy_every=1, **kwargs):
+        super().__init__(copy_target_value=copy_target_value, copy_distinct=copy_distinct, copy_in_bounds=copy_in_bounds,
+                         copy_out_bounds=copy_out_bounds, copy_every=copy_every, **kwargs)
         self._neighbor_list = None
+
+
+    def init(self, model):
+        self._neighbor_list = init_neighbor_list(model)
+        mins, maxs = model.labels.min(axis=0), model.labels.max(axis=0)
+
+        if self.copy_in_bounds is not None:
+            self.copy_in_bounds = normalize_bounds(self.copy_in_bounds)
+            for bound in self.copy_in_bounds:
+                for i, j in np.ndindex((2,2)):
+                    bound[i][j] = (mins, maxs)[i][j] if bound[i][j] is None else bound[i][j]
+        else:
+            self.copy_in_bounds = [(mins, maxs)]
+
+        if self.copy_out_bounds is not None:
+            self.copy_out_bounds = normalize_bounds(self.copy_out_bounds)[0]
+            for i, j in np.ndindex((2,2)):
+                self.copy_out_bounds[i][j] = (mins, maxs)[i][j] if self.copy_out_bounds[i][j] is None else self.copy_out_bounds[i][j]
+        else:
+            self.copy_out_bounds = [(mins, maxs)]
+
+        self.mins, self.maxs = mins, maxs
+
+        print("copy_in_bounds", self.copy_in_bounds)
+        print("copy_out_bounds", self.copy_out_bounds)
 
     def on_sample(self, i, model, result):
         if self._neighbor_list is None:
-            self._neighbor_list = init_neighbor_list(model)
+            self.init(model)
 
-        mins, maxs = model.labels.min(axis=0), model.labels.max(axis=0)
-
-        # Determine destination bounds
-        if self.copy_out_bounds is not None:
-            out_bounds = normalize_bounds(self.copy_out_bounds)
-        else:
-            out_bounds = [(mins, maxs)]
-
-        if self.copy_in_bounds is not None:
-            in_bounds = normalize_bounds(self.copy_in_bounds)
-        else:
-            in_bounds = [(mins, maxs)]
+        if i % self.copy_every:
+            return False
 
         regions_to_copy = []
-        for bound in in_bounds:
+        for bound in self.copy_in_bounds:
             source_regions = find_regions_bounded(self._neighbor_list, model.spin, model.labels, [bound], self.copy_target_value)
             if source_regions:
                 regions_to_copy.append(pick_region(source_regions, self.copy_distinct))
 
         for region in regions_to_copy:
-            random_place_region(model, region, out_bounds)
+            random_place_region(model, region, self.copy_out_bounds)
 
 
         return False
